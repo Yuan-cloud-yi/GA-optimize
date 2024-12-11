@@ -1,0 +1,304 @@
+
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import math
+
+# 定义参数
+N = 5  # 用户数量
+w1, w2 = 0.5, 0.5  # 权重系数
+f_local = 1e7  # 本地计算能力 (CPU cycles/s)
+f_edge_max = 1e10  # 边缘服务器最大计算能力 (CPU cycles/s)
+B = 1e9  # 最大传输速率 (bits/s)
+d = 100  # 传输距离 (meters)
+P_transmit = 0.1  # 传输功率 (Watts)
+E_local_per_cycle = 1e-9  # 本地计算能耗 (Joules/cycle)
+p_noisy_los = 10 ** (-13)  # 噪声功率-100dBm
+p_uplink = 0.1  # 上行链路传输功率0.1W
+alpha0 = 0.00001  # 距离为1m时的参考信道增益-50dB = 0.001
+g_mec_ue = abs(alpha0 / d ** 2)  # 信道增益
+
+# 假定每个用户的计算量和任务大小
+C = [random.randint(1e7, 1e8) for _ in range(N)]  # 计算量 (CPU cycles)
+D = [random.randint(1e6, 1e7) for _ in range(N)]  # 任务大小 (bits)
+
+def cost_function(x):
+    total_cost = 0
+    edge_computation_used = 0
+    edge_bandwidth_used = 0
+
+    for i in range(N):
+        if x[i] == 0:
+            delay_local = C[i] / f_local
+            energy_local = C[i] * E_local_per_cycle
+            total_cost += w1 * delay_local + w2 * energy_local
+        else:
+            allocated_cpu = max(min(x[N + i], f_edge_max), 0)
+            allocated_bandwidth = max(min(x[2 * N + i], B), 0)
+
+            if allocated_cpu == 0 or allocated_bandwidth == 0:
+                return float('inf')
+
+            v = allocated_bandwidth * math.log2(1 + p_uplink * g_mec_ue / p_noisy_los)
+            delay_transmission = D[i] / v
+            delay_edge = C[i] / allocated_cpu
+            energy_transmission = P_transmit * delay_transmission
+            energy_edge = C[i] * E_local_per_cycle
+
+            total_cost += w1 * (delay_transmission + delay_edge) + w2 * (energy_transmission + energy_edge)
+            edge_computation_used += allocated_cpu
+            edge_bandwidth_used += allocated_bandwidth
+
+    if edge_computation_used > f_edge_max or edge_bandwidth_used > B:
+        return float('inf')
+
+    return total_cost
+
+class GeneticAlgorithm:
+    def __init__(self, population_size, crossover_rate, mutation_rate, generations):
+        self.population_size = population_size
+        self.crossover_rate = crossover_rate
+        self.mutation_rate = mutation_rate
+        self.generations = generations
+        self.population = self._initialize_population()
+        self.best_solution = None
+        self.best_fitness = -float('inf')
+
+    def _initialize_population(self):
+        """初始化种群，确保合理的资源分配"""
+        population = []
+        for _ in range(self.population_size):
+            chromosome = []
+            for i in range(N):
+                offload_decision = random.choice([0, 1])
+                chromosome.append(offload_decision)
+                if offload_decision == 1:  # 只有在卸载时才分配资源
+                    chromosome.append(random.uniform(0, f_edge_max))
+                    chromosome.append(random.uniform(0, B))
+                else:  # 本地执行时不分配边缘资源
+                    chromosome.extend([0, 0])
+            population.append(chromosome)
+        return np.array(population)
+
+    def fitness(self, chromosome):
+        cost = cost_function(chromosome)
+        return 1 / (cost + 1e-10)
+
+    def selection(self):
+        fitnesses = np.array([self.fitness(chromosome) for chromosome in self.population])
+        probabilities = fitnesses / np.sum(fitnesses)
+        selected_indices = np.random.choice(np.arange(self.population_size), size=self.population_size, p=probabilities)
+        self.population = self.population[selected_indices]
+
+    def crossover(self):
+        for i in range(0, self.population_size, 2):
+            if random.random() < self.crossover_rate:
+                crossover_point = random.randint(1, len(self.population[i]) - 1)
+                temp = self.population[i, crossover_point:].copy()
+                self.population[i, crossover_point:] = self.population[i + 1, crossover_point:]
+                self.population[i + 1, crossover_point:] = temp
+
+    def mutate(self):
+        for i in range(self.population_size):
+            for j in range(len(self.population[i])):
+                if random.random() < self.mutation_rate:
+                    if j < N:
+                        self.population[i, j] = 1 - self.population[i, j]
+                    elif N <= j < 2 * N and self.population[i, j - N] == 1:
+                        self.population[i, j] = random.uniform(0, f_edge_max)
+                    elif 2 * N <= j < 3 * N and self.population[i, j - 2 * N] == 1:
+                        self.population[i, j] = random.uniform(0, B)
+
+    def evolve(self):
+        best_fitness_history = []
+        for generation in range(self.generations):
+            self.selection()
+            self.crossover()
+            self.mutate()
+
+            # 更新最佳解，采用精英保留策略
+            new_best_found = False
+            for chromosome in self.population:
+                fitness = self.fitness(chromosome)
+                if fitness > self.best_fitness:
+                    self.best_fitness = fitness
+                    self.best_solution = chromosome.copy()
+                    new_best_found = True
+
+            if not new_best_found:
+                print(f"Generation {generation + 1}/{self.generations}: No valid solution found.")
+            else:
+                print(f"Generation {generation + 1}/{self.generations}, Best Fitness: {self.best_fitness}")
+
+            best_fitness_history.append(self.best_fitness)
+
+        return self.best_solution, 1 / self.best_fitness, best_fitness_history
+
+
+# 参数设置
+population_size = 100  # 种群大小
+crossover_rate = 0.8  # 交叉概率
+mutation_rate = 0.1  # 变异概率
+generations = 100  # 进化代数
+
+# 创建并运行遗传算法优化器
+ga = GeneticAlgorithm(population_size, crossover_rate, mutation_rate, generations)
+best_solution, best_cost, best_fitness_history = ga.evolve()
+
+if best_solution is not None:
+    print("Best Solution:")
+    for i in range(N):
+        offload = int(best_solution[i])
+        cpu = max(min(best_solution[N + i], f_edge_max), 0) if offload == 1 else 0
+        bandwidth = max(min(best_solution[2 * N + i], B), 0) if offload == 1 else 0
+
+        print(f"User {i}: Offload={offload}, CPU={cpu:.2e}, Bandwidth={bandwidth:.2e}")
+    print("Best Cost:", best_cost)
+else:
+    print("No valid solution found.")
+
+# 可视化结果
+plt.plot(range(1, generations + 1), [1 / fitness for fitness in best_fitness_history], marker='o')
+plt.title('Best Cost Over Generations')
+plt.xlabel('Generations')
+plt.ylabel('Cost')
+plt.grid(True)
+plt.show()
+
+# 计算每个用户的能耗
+user_energy = []
+for i in range(N):
+    offload = int(best_solution[i])
+    if offload == 0:
+        # 本地执行
+        energy = C[i] * E_local_per_cycle
+    else:
+        # 卸载到边缘服务器
+        allocated_cpu = max(min(best_solution[N + i], f_edge_max), 0)
+        allocated_bandwidth = max(min(best_solution[2 * N + i], B), 0)
+
+        v = allocated_bandwidth * math.log2(1 + p_uplink * g_mec_ue / p_noisy_los)
+        delay_transmission = D[i] / v
+        energy_transmission = P_transmit * delay_transmission
+        energy_edge = C[i] * E_local_per_cycle  # 假设边缘服务器能耗与本地相同
+
+        energy = energy_transmission + energy_edge
+
+    user_energy.append(energy)
+
+# 打印每个用户的能耗
+for i, energy in enumerate(user_energy):
+    print(f"User {i} Energy Consumption: {energy:.2e} Joules")
+
+# 可视化结果 - 柱状图
+plt.bar(range(N), user_energy, tick_label=[f'User {i}' for i in range(N)])
+plt.title('Energy Consumption Per User')
+plt.xlabel('Users')
+plt.ylabel('Energy (Joules)')
+plt.grid(axis='y')
+plt.show()
+
+# 计算每个用户的时延
+user_delay = []
+for i in range(N):
+    offload = int(best_solution[i])
+    if offload == 0:
+        # 本地执行
+        delay = C[i] / f_local
+    else:
+        # 卸载到边缘服务器
+        allocated_cpu = max(min(best_solution[N + i], f_edge_max), 0)
+        allocated_bandwidth = max(min(best_solution[2 * N + i], B), 0)
+
+        v = allocated_bandwidth * math.log2(1 + p_uplink * g_mec_ue / p_noisy_los)
+        delay_transmission = D[i] / v
+        delay_edge = C[i] / allocated_cpu
+
+        delay = delay_transmission + delay_edge
+
+    user_delay.append(delay)
+
+# 打印每个用户的时延
+for i, delay in enumerate(user_delay):
+    print(f"User {i} Delay: {delay:.6f} seconds")
+
+# 可视化结果 - 柱状图
+plt.figure(figsize=(10, 6))
+plt.bar(range(N), user_delay, tick_label=[f'User {i}' for i in range(N)], color='skyblue')
+plt.title('Delay Per User')
+plt.xlabel('Users')
+plt.ylabel('Delay (seconds)')
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.show()
+
+# 计算每个用户的总成本
+user_total_cost = []
+for i in range(N):
+    offload = int(best_solution[i])
+    if offload == 0:
+        # 本地执行
+        delay_local = C[i] / f_local
+        energy_local = C[i] * E_local_per_cycle
+        total_cost_user = w1 * delay_local + w2 * energy_local
+    else:
+        # 卸载到边缘服务器
+        allocated_cpu = max(min(best_solution[N + i], f_edge_max), 0)
+        allocated_bandwidth = max(min(best_solution[2 * N + i], B), 0)
+
+        v = allocated_bandwidth * math.log2(1 + p_uplink * g_mec_ue / p_noisy_los)
+        delay_transmission = D[i] / v
+        delay_edge = C[i] / allocated_cpu
+        energy_transmission = P_transmit * delay_transmission
+        energy_edge = C[i] * E_local_per_cycle  # 假设边缘服务器能耗与本地相同
+
+        total_cost_user = w1 * (delay_transmission + delay_edge) + w2 * (energy_transmission + energy_edge)
+
+    user_total_cost.append(total_cost_user)
+
+# 打印每个用户的总成本
+for i, cost in enumerate(user_total_cost):
+    print(f"User {i} Total Cost: {cost:.2e}")
+
+# 可视化结果 - 柱状图
+plt.bar(range(N), user_total_cost, tick_label=[f'User {i}' for i in range(N)])
+plt.title('Total Cost Per User')
+plt.xlabel('Users')
+plt.ylabel('Total Cost')
+plt.grid(axis='y')
+plt.show()
+
+# 计算每个用户的总成本
+user_total_cost = []
+for i in range(N):
+    offload = int(best_solution[i])
+    if offload == 0:
+        # 本地执行
+        delay_local = C[i] / f_local
+        energy_local = C[i] * E_local_per_cycle
+        total_cost_user = 0.7 * delay_local + 0.3 * energy_local
+    else:
+        # 卸载到边缘服务器
+        allocated_cpu = max(min(best_solution[N + i], f_edge_max), 0)
+        allocated_bandwidth = max(min(best_solution[2 * N + i], B), 0)
+
+        v = allocated_bandwidth * math.log2(1 + p_uplink * g_mec_ue / p_noisy_los)
+        delay_transmission = D[i] / v
+        delay_edge = C[i] / allocated_cpu
+        energy_transmission = P_transmit * delay_transmission
+        energy_edge = C[i] * E_local_per_cycle  # 假设边缘服务器能耗与本地相同
+
+        total_cost_user = w1 * (delay_transmission + delay_edge) + w2 * (energy_transmission + energy_edge)
+
+    user_total_cost.append(total_cost_user)
+
+# 打印每个用户的总成本
+for i, cost in enumerate(user_total_cost):
+    print(f"User {i} Total Cost: {cost:.2e}")
+
+# 可视化结果 - 柱状图
+plt.bar(range(N), user_total_cost, tick_label=[f'User {i}' for i in range(N)])
+plt.title('Total Cost Per User')
+plt.xlabel('Users')
+plt.ylabel('Total Cost')
+plt.grid(axis='y')
+plt.show()
